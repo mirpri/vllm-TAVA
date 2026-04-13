@@ -44,6 +44,8 @@ from vllm.entrypoints.utils import get_max_tokens
 from vllm.inputs.data import TokensPrompt as EngineTokensPrompt
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.mm_trace import is_env_enabled as mm_trace_env_enabled
+from vllm.mm_trace import parse_mm_trace_kwargs
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 from vllm.sampling_params import BeamSearchParams, SamplingParams
@@ -55,6 +57,19 @@ from vllm.utils import as_list
 
 logger = init_logger(__name__)
 
+
+def _coerce_request_prune_ratio(value: object) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid request prune_ratio: {value!r}"
+        ) from exc
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(
+            f"Request prune_ratio out of range: {ratio}"
+        )
+    return ratio
 
 class OpenAIServingChat(OpenAIServing):
 
@@ -232,6 +247,21 @@ class OpenAIServingChat(OpenAIServing):
                         "Chat template is passed with request, but "
                         "--trust-request-chat-template is not set. "
                         "Refused request with untrusted chat template.")
+                if request.vllm_xargs and "prune_ratio" in request.vllm_xargs:
+                    request_ratio = _coerce_request_prune_ratio(
+                        request.vllm_xargs["prune_ratio"]
+                    )
+                    mm_kwargs = dict(request.mm_processor_kwargs or {})
+                    existing_ratio = mm_kwargs.get("prune_ratio")
+                    if existing_ratio is not None:
+                        mm_ratio = _coerce_request_prune_ratio(existing_ratio)
+                        if mm_ratio != request_ratio:
+                            raise ValueError(
+                                "Request prune_ratio mismatch between "
+                                "vllm_xargs and mm_processor_kwargs."
+                            )
+                    mm_kwargs["prune_ratio"] = request_ratio
+                    request.mm_processor_kwargs = mm_kwargs
                 (
                     conversation,
                     request_prompts,
@@ -258,6 +288,33 @@ class OpenAIServingChat(OpenAIServing):
                     request_prompts,
                     engine_prompts,
                 ) = self._make_request_with_harmony(request)
+
+            if mm_trace_env_enabled():
+                trace_enabled, forced_grid, forced_total = \
+                    parse_mm_trace_kwargs(request.mm_processor_kwargs)
+                if trace_enabled:
+                    mm_items = 0
+                    modalities: set[str] = set()
+                    for prompt in engine_prompts:
+                        mm_data = prompt.get("multi_modal_data")
+                        if not mm_data:
+                            continue
+                        for modality, items in mm_data.items():
+                            modalities.add(modality)
+                            if isinstance(items, list):
+                                mm_items += len(items)
+                            else:
+                                mm_items += 1
+                    logger.info(
+                        "[MMTrace] openai_chat request_id=%s mm_items=%s "
+                        "modalities=%s forced_grid=%s "
+                        "forced_total_patches=%s",
+                        request.request_id,
+                        mm_items,
+                        ",".join(sorted(modalities)),
+                        forced_grid,
+                        forced_total,
+                    )
         except (ValueError, TypeError, RuntimeError,
                 jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -292,6 +349,9 @@ class OpenAIServingChat(OpenAIServing):
                     sampling_params = request.to_sampling_params(
                         max_tokens, self.model_config.logits_processor_pattern,
                         self.default_sampling_params)
+
+                if isinstance(sampling_params, SamplingParams) and sampling_params.extra_args is None:
+                        sampling_params.extra_args = {}
 
                 self._log_inputs(request_id,
                                  request_prompts[i],

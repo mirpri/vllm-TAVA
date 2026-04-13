@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from ast import Dict
 import asyncio
 import contextlib
 import multiprocessing
@@ -911,6 +912,12 @@ class AsyncMPClient(MPClient):
 
     async def profile_async(self, is_start: bool = True) -> None:
         await self.call_utility_async("profile", is_start)
+
+    async def start_prune(self,prune_config:Dict) -> None:
+        await self.call_utility_async("start_prune",prune_config)
+
+    async def stop_prune(self) -> None:
+        await self.call_utility_async("stop_prune")
 
     async def reset_mm_cache_async(self) -> None:
         await self.call_utility_async("reset_mm_cache")

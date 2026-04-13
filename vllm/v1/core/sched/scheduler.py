@@ -176,6 +176,11 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+        # Optional logging for multimodal scheduling and prefill/decode split
+        import os as _os
+        self._log_mm_sched = _os.environ.get("VLLM_LOG_MM_SCHED") == "1"
+        self._log_pd = _os.environ.get("VLLM_LOG_PD") == "1"
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -204,6 +209,17 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        if self._log_mm_sched:
+            try:
+                logger.info(
+                    "[Sched] step_start waiting=%d running=%d token_budget=%d encoder_budget=%d",
+                    self.waiting.size() if hasattr(self.waiting, "size") else len(self.waiting),
+                    len(self.running),
+                    token_budget,
+                    encoder_compute_budget,
+                )
+            except Exception:
+                pass
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -298,6 +314,18 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+
+            if self._log_pd:
+                try:
+                    comp = int(request.num_computed_tokens)
+                    prefill_remain = max(0, int(request.num_prompt_tokens) - comp)
+                    scheduled_prefill = min(int(num_new_tokens), prefill_remain)
+                    scheduled_decode = max(0, int(num_new_tokens) - scheduled_prefill)
+                    logger.info(
+                        "[PD] req_id=%s scheduled=%s prefill=%s decode=%s",
+                        request.request_id, int(num_new_tokens), scheduled_prefill, scheduled_decode)
+                except Exception:
+                    pass
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -447,6 +475,16 @@ class Scheduler(SchedulerInterface):
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
+                    if self._log_mm_sched and encoder_inputs_to_schedule:
+                        try:
+                            logger.info(
+                                "[Sched] encoder_schedule req=%s inputs=%s budget_remain=%d",
+                                request.request_id,
+                                ",".join(map(str, encoder_inputs_to_schedule)),
+                                new_encoder_compute_budget,
+                            )
+                        except Exception:
+                            pass
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
@@ -624,6 +662,22 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+
+        if self._log_mm_sched:
+            try:
+                total = int(total_num_scheduled_tokens)
+                enc_total = sum(len(v) for v in scheduled_encoder_inputs.values())
+                logger.info(
+                    "[Sched] step_done tokens=%d new=%d resumed=%d running=%d common_prefix=%s encoder_inputs=%d",
+                    total,
+                    len(scheduled_new_reqs),
+                    len(scheduled_resumed_reqs),
+                    len(scheduled_running_reqs),
+                    ",".join(map(str, num_common_prefix_blocks)) if isinstance(num_common_prefix_blocks, list) else str(num_common_prefix_blocks),
+                    enc_total,
+                )
+            except Exception:
+                pass
         return scheduler_output
 
     def _update_after_schedule(

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -16,6 +17,7 @@ import torch
 from typing_extensions import TypeVar, assert_never
 
 from vllm.logger import init_logger
+from vllm.mm_trace import get_mm_trace_state
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.transformers_utils.tokenizer import (AnyTokenizer, decode_tokens,
                                                encode_tokens)
@@ -43,6 +45,22 @@ if TYPE_CHECKING:
     from .profiling import BaseDummyInputsBuilder
 
 logger = init_logger(__name__)
+_MM_SHAPE_TRACE_ENV = os.getenv("VLLM_MM_SHAPE_TRACE", "0") == "1"
+
+
+def _format_mm_shape_value(value: object) -> str:
+    if isinstance(value, torch.Tensor):
+        return f"tensor shape={tuple(value.shape)} dtype={value.dtype}"
+    if isinstance(value, list):
+        if not value:
+            return "list len=0"
+        shapes = [tuple(item.shape) for item in value[:3]]
+        suffix = "" if len(value) <= 3 else f" ... total={len(value)}"
+        return (
+            f"list len={len(value)} shapes={shapes}{suffix} "
+            f"dtype0={value[0].dtype}"
+        )
+    return f"type={type(value).__name__}"
 
 _S = TypeVar("_S", str, list[int])
 
@@ -1053,6 +1071,19 @@ class InputProcessingContext:
             allow_var_kwargs=True,
         )
 
+        trace = get_mm_trace_state()
+        if trace is not None:
+            data_keys = ",".join(sorted(data.keys()))
+            kwargs_keys = ",".join(sorted(allowed_kwargs.keys()))
+            logger.info(
+                "[MMTrace] hf_processor_call request_id=%s processor=%s "
+                "data_keys=%s kwargs_keys=%s",
+                trace.request_id,
+                type(hf_processor).__name__,
+                data_keys,
+                kwargs_keys,
+            )
+
         try:
             output = hf_processor(**data,
                                   **allowed_kwargs,
@@ -1084,6 +1115,21 @@ class InputProcessingContext:
 
         if isinstance(output, BatchFeature):
             output_ = self._postprocess_output(output.data)
+            if _MM_SHAPE_TRACE_ENV:
+                pixel_values = output_.get("pixel_values")
+                if pixel_values is not None:
+                    trace = get_mm_trace_state()
+                    request_id = trace.request_id if trace is not None else "n/a"
+                    image_sizes = output_.get("image_sizes")
+                    image_sizes_info = ("n/a" if image_sizes is None else
+                                        _format_mm_shape_value(image_sizes))
+                    logger.info(
+                        "[MMShape] hf_processor_output request_id=%s "
+                        "pixel_values=%s image_sizes=%s",
+                        request_id,
+                        _format_mm_shape_value(pixel_values),
+                        image_sizes_info,
+                    )
             return BatchFeature(output_)
 
         logger.warning_once(

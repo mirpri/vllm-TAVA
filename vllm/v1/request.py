@@ -36,6 +36,7 @@ class Request:
         arrival_time: Optional[float] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         mm_features: Optional[list[MultiModalFeatureSpec]] = None,
+        mm_trace: bool = False,
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
@@ -99,6 +100,7 @@ class Request:
         self.mm_features = mm_features or []
         self.num_encoder_inputs = len(self.mm_features)
         self.has_encoder_inputs = self.num_encoder_inputs > 0
+        self.mm_trace = mm_trace
 
         # Read-only views
         # Prevent directly appending to these lists since
@@ -133,6 +135,7 @@ class Request:
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
             mm_features=request.mm_features,
+            mm_trace=request.mm_trace,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             eos_token_id=request.eos_token_id,

@@ -3,6 +3,7 @@
 """Minimal implementation of CLIPVisionModel intended to be only used
 within a vision language model."""
 from collections.abc import Iterable
+import os
 from typing import Optional, Union
 
 import torch
@@ -11,6 +12,8 @@ from transformers import CLIPVisionConfig
 
 from vllm.attention.layer import MultiHeadAttention
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
+from vllm.mm_trace import get_mm_trace_state
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
@@ -20,6 +23,47 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsQuant
 
 from .vision import VisionEncoderInfo, resolve_visual_encoder_outputs
+
+logger = init_logger(__name__)
+_MM_SHAPE_TRACE_ENV = os.getenv("VLLM_MM_SHAPE_TRACE", "0") == "1"
+_MM_CLS2PATCH_TRACE_ENV = os.getenv("VLLM_MM_CLS2PATCH_TRACE", "0") == "1"
+_LLAVA_NEXT_DEBUG_ENV = os.getenv("LLAVA_NEXT_DEBUG") == "1"
+
+
+def _get_mm_cls2patch_topk() -> int:
+    text = os.getenv("VLLM_MM_CLS2PATCH_TOPK", "0")
+    try:
+        value = int(text)
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
+def _get_mm_cls2patch_log_topk() -> int:
+    text = os.getenv("VLLM_MM_CLS2PATCH_LOG_TOPK")
+    if not text:
+        return 8
+    try:
+        value = int(text)
+    except ValueError:
+        return 8
+    return max(1, value)
+
+
+def _get_mm_cls2patch_trace_max_patches() -> int:
+    text = os.getenv("VLLM_MM_CLS2PATCH_TRACE_MAX_PATCHES")
+    if not text:
+        return 1
+    try:
+        value = int(text)
+    except ValueError:
+        return 1
+    return max(1, value)
+
+
+def _get_mm_shape_request_id() -> str:
+    state = get_mm_trace_state()
+    return state.request_id if state is not None else "n/a"
 
 
 class CLIPEncoderInfo(VisionEncoderInfo[CLIPVisionConfig]):
@@ -75,14 +119,39 @@ class CLIPVisionEmbeddings(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         batch_size = pixel_values.shape[0]
+        trace_id = ""
+        if _MM_SHAPE_TRACE_ENV:
+            trace_id = _get_mm_shape_request_id()
+            logger.info(
+                "[MMShape] clip_pixel_values request_id=%s shape=%s dtype=%s",
+                trace_id,
+                tuple(pixel_values.shape),
+                pixel_values.dtype,
+            )
         target_dtype = self.patch_embedding.weight.dtype
         patch_embeds = self.patch_embedding(pixel_values.to(
             dtype=target_dtype))  # shape = [*, width, grid, grid]
+        if _MM_SHAPE_TRACE_ENV:
+            logger.info(
+                "[MMShape] clip_patch_embeds request_id=%s shape=%s "
+                "grid=(%s,%s)",
+                trace_id,
+                tuple(patch_embeds.shape),
+                patch_embeds.shape[-2],
+                patch_embeds.shape[-1],
+            )
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
         embeddings = embeddings + self.position_embedding(self.position_ids)
+        if _MM_SHAPE_TRACE_ENV:
+            logger.info(
+                "[MMShape] clip_embeddings request_id=%s shape=%s seq_len=%s",
+                trace_id,
+                tuple(embeddings.shape),
+                embeddings.shape[1],
+            )
 
         return embeddings
 
@@ -247,9 +316,92 @@ class CLIPEncoder(nn.Module):
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         hidden_states_pool = [inputs_embeds]
         hidden_states = inputs_embeds
+        self._mm_last_cls2patch = None
+        if _LLAVA_NEXT_DEBUG_ENV:
+            logger.info(
+                "[MMDebug] clip_encoder reset cls2patch inputs=%s layers=%s",
+                tuple(inputs_embeds.shape),
+                len(self.layers),
+            )
 
-        for encoder_layer in self.layers:
+        target_layer_idx = len(self.layers) - 1
+        for layer_idx, encoder_layer in enumerate(self.layers):
+            cls2patch_topk = _get_mm_cls2patch_topk()
+            if (cls2patch_topk > 0 or _MM_CLS2PATCH_TRACE_ENV) \
+                    and layer_idx == target_layer_idx:
+                normed_states = encoder_layer.layer_norm1(hidden_states)
+                qkv_states, _ = encoder_layer.self_attn.qkv_proj(normed_states)
+                query_states, key_states, _ = qkv_states.chunk(3, dim=-1)
+                bsz, seq_len, _ = query_states.shape
+                num_heads = encoder_layer.self_attn.num_heads_per_partition
+                head_dim = encoder_layer.self_attn.head_dim
+                query_states = query_states.view(bsz, seq_len, num_heads,
+                                                 head_dim).transpose(1, 2)
+                key_states = key_states.view(bsz, seq_len, num_heads,
+                                             head_dim).transpose(1, 2)
+                q_cls = query_states[:, :, 0:1, :]
+                attn_logits = torch.matmul(
+                    q_cls, key_states.transpose(-2, -1)).squeeze(2)
+                attn_logits = attn_logits * encoder_layer.self_attn.scale
+                attn_probs = torch.softmax(attn_logits.float(), dim=-1)
+                cls2patch = attn_probs[:, :, 1:]
+                cls2patch_mean = cls2patch.mean(dim=1)
+                self._mm_last_cls2patch = cls2patch_mean
+                if _LLAVA_NEXT_DEBUG_ENV:
+                    logger.info( #[1,576]
+                        "[MMDebug] clip_encoder set cls2patch shape=%s",
+                        tuple(cls2patch_mean.shape),
+                    )
+                if _MM_CLS2PATCH_TRACE_ENV:
+                    topk = min(_get_mm_cls2patch_log_topk(),
+                               cls2patch_mean.shape[-1])
+                    max_patches = _get_mm_cls2patch_trace_max_patches()
+                    rows = min(bsz, max_patches)
+                    trace_id = _get_mm_shape_request_id()
+                    for patch_row in range(rows):
+                        if topk > 0 and cls2patch_mean.numel() > 0:
+                            topk_values, topk_indices = torch.topk(
+                                cls2patch_mean[patch_row], k=topk)
+                            topk_values = topk_values.detach().cpu().tolist()
+                            topk_indices = topk_indices.detach().cpu().tolist()
+                        else:
+                            topk_values = []
+                            topk_indices = []
+                        logger.info(
+                            "[MMCls2Patch] request_id=%s layer_idx=%s "
+                            "loaded_layers=%s full_layers=%s b_patches=%s "
+                            "seq_len=%s num_heads=%s head_dim=%s "
+                            "cls2patch_shape=%s patch_row=%s topk_idx=%s "
+                            "topk_val=%s",
+                            trace_id,
+                            layer_idx,
+                            len(self.layers),
+                            self.config.num_hidden_layers,
+                            bsz,
+                            seq_len,
+                            encoder_layer.self_attn.num_heads,
+                            head_dim,
+                            tuple(cls2patch_mean.shape),
+                            patch_row,
+                            topk_indices,
+                            topk_values,
+                        )
             hidden_states = encoder_layer(hidden_states)
+            if _MM_SHAPE_TRACE_ENV and layer_idx == target_layer_idx:
+                trace_id = _get_mm_shape_request_id()
+                logger.info(
+                    "[MMShape] clip_encoder_layer request_id=%s "
+                    "layer_idx=%s loaded_layers=%s full_layers=%s "
+                    "hidden_states=%s seq_len=%s num_heads=%s head_dim=%s",
+                    trace_id,
+                    layer_idx,
+                    len(self.layers),
+                    self.config.num_hidden_layers,
+                    tuple(hidden_states.shape),
+                    hidden_states.shape[1],
+                    encoder_layer.self_attn.num_heads,
+                    encoder_layer.self_attn.head_dim,
+                )
             if return_all_hidden_states:
                 hidden_states_pool.append(hidden_states)
         # If we have multiple feature sample layers, we return all hidden

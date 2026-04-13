@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+import os
 from typing import Literal, Optional, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
@@ -182,6 +183,17 @@ class KVCacheManager:
             self.coordinator.find_longest_cache_hit(request.block_hashes,
                                                     max_cache_hit_length))
 
+        if os.environ.get("VLLM_LOG_IMG_KV") == "1":
+            try:
+                logger.info(
+                    "[ImgTok][KV] req=%s computed_tokens=%d prompt_tokens=%d",
+                    request.request_id,
+                    num_new_computed_tokens,
+                    request.num_tokens,
+                )
+            except Exception:
+                pass
+
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.requests += 1
@@ -270,6 +282,16 @@ class KVCacheManager:
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
+            if os.environ.get("VLLM_LOG_IMG_KV") == "1":
+                try:
+                    logger.info(
+                        "[ImgTok][KV] req=%s alloc_failed required=%d free=%d",
+                        request.request_id,
+                        num_blocks_to_allocate,
+                        self.block_pool.get_num_free_blocks(),
+                    )
+                except Exception:
+                    pass
             return None
 
         # Touch the computed blocks to make sure they won't be evicted.
@@ -300,6 +322,17 @@ class KVCacheManager:
         num_tokens_to_cache = min(num_computed_tokens + num_new_tokens,
                                   request.num_tokens)
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+
+        if os.environ.get("VLLM_LOG_IMG_KV") == "1":
+            try:
+                logger.info(
+                    "[ImgTok][KV] req=%s allocated_blocks=%d cached_tokens=%d",
+                    request.request_id,
+                    sum(len(g) for g in new_blocks),
+                    num_tokens_to_cache,
+                )
+            except Exception:
+                pass
 
         return KVCacheBlocks(new_blocks)
 

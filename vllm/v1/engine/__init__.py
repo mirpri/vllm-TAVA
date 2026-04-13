@@ -69,6 +69,7 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Optional[Mapping[str, str]] = None
+    mm_trace: bool = False
 
 
 class EngineCoreEventType(enum.IntEnum):

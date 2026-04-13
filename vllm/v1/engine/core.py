@@ -13,6 +13,7 @@ from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
+import json
 
 import msgspec
 import zmq
@@ -166,6 +167,28 @@ class EngineCore:
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
 
+        # Optional calltrace logging (enabled when VLLM_LOG_CALLTRACE=1)
+        self._log_calltrace = os.environ.get("VLLM_LOG_CALLTRACE") == "1"
+        self._running_snapshot_enabled = os.environ.get(
+            "VLLM_RUNNING_SNAPSHOT_ENABLE") == "1"
+        self._running_snapshot_path = os.environ.get(
+            "VLLM_RUNNING_SNAPSHOT_PATH", "")
+        self._running_snapshot_interval_ms = int(
+            os.environ.get("VLLM_RUNNING_SNAPSHOT_INTERVAL_MS", "100"))
+        self._running_snapshot_last_ts = 0.0
+        if self._running_snapshot_enabled:
+            if not self._running_snapshot_path:
+                raise ValueError(
+                    "VLLM_RUNNING_SNAPSHOT_PATH is required when "
+                    "VLLM_RUNNING_SNAPSHOT_ENABLE=1")
+            snapshot_dir = os.path.dirname(self._running_snapshot_path)
+            if snapshot_dir:
+                os.makedirs(snapshot_dir, exist_ok=True)
+            if os.environ.get("VLLM_RUNNING_SNAPSHOT_TRUNCATE") == "1":
+                with open(self._running_snapshot_path, "w",
+                          encoding="utf-8"):
+                    pass
+
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
@@ -279,13 +302,38 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            if self._log_calltrace:
+                try:
+                    running, waiting = self.scheduler.get_request_counts()
+                    logger.info("[CallTrace] step: idle running=%s waiting=%s", running, waiting)
+                except Exception:
+                    pass
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        if self._log_calltrace:
+            try:
+                num_reqs = len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {})
+                logger.info(
+                    "[CallTrace] scheduled: total_tokens=%s reqs=%s",
+                    getattr(scheduler_output, "total_num_scheduled_tokens", 0),
+                    num_reqs,
+                )
+            except Exception:
+                pass
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
+
+        self._maybe_write_running_snapshot()
+        if self._log_calltrace:
+            try:
+                num_clients = len(engine_core_outputs)
+                num_out = sum(len(getattr(eco, "outputs", []) or []) for eco in engine_core_outputs.values())
+                logger.info("[CallTrace] updated: clients=%s outputs=%s", num_clients, num_out)
+            except Exception:
+                pass
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
@@ -329,6 +377,17 @@ class EngineCore:
                 (future, scheduler_output))  # type: ignore[arg-type]
 
             model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if self._log_calltrace:
+                try:
+                    num_reqs = len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {})
+                    logger.info(
+                        "[CallTrace] enqueued: total_tokens=%s reqs=%s queue_len=%s",
+                        getattr(scheduler_output, "total_num_scheduled_tokens", 0),
+                        num_reqs,
+                        len(batch_queue),
+                    )
+                except Exception:
+                    pass
             if model_executed and len(batch_queue) < self.batch_queue_size \
                 and not batch_queue[-1][0].done():
                 # Don't block on next worker response unless the queue is full
@@ -348,8 +407,95 @@ class EngineCore:
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)
+        self._maybe_write_running_snapshot()
+
+        if self._log_calltrace:
+            try:
+                num_clients = len(engine_core_outputs)
+                num_out = sum(len(getattr(eco, "outputs", []) or []) for eco in engine_core_outputs.values())
+                logger.info(
+                    "[CallTrace] dequeued: outputs=%s clients=%s queue_len=%s",
+                    num_out,
+                    num_clients,
+                    len(batch_queue),
+                )
+            except Exception:
+                pass
 
         return engine_core_outputs, model_executed
+    
+    def _maybe_write_running_snapshot(self) -> None:
+        if not self._running_snapshot_enabled:
+            return
+        now = time.monotonic()
+        if self._running_snapshot_last_ts:
+            elapsed_ms = (now - self._running_snapshot_last_ts) * 1000.0
+            if elapsed_ms < self._running_snapshot_interval_ms:
+                return
+        self._running_snapshot_last_ts = now
+
+        sum_prefill_len = 0
+        sum_prefill_len_square = 0
+        prefill_batch_size = 0
+        sum_decode_len = 0
+        sum_decode_len_square = 0
+        decode_batch_size = 0
+        running_request_ids_raw = []
+        for req in self.scheduler.running:
+            if req.status != RequestStatus.RUNNING:
+                continue
+            req_id_full = req.request_id
+            if req_id_full.startswith("chatcmpl-"):
+                req_id_raw = req_id_full[len("chatcmpl-"):]
+            else:
+                req_id_raw = req_id_full
+            running_request_ids_raw.append(req_id_raw)
+
+            num_prompt_tokens = int(req.num_prompt_tokens)
+            num_computed_tokens = int(req.num_computed_tokens)
+            prefill_rem = num_prompt_tokens - num_computed_tokens
+            if prefill_rem < 0:
+                prefill_rem = 0
+            if prefill_rem > 0:
+                sum_prefill_len += prefill_rem
+                sum_prefill_len_square += prefill_rem * prefill_rem
+                prefill_batch_size += 1
+            else:
+                decode_len = int(req.num_tokens)
+                sum_decode_len += decode_len
+                sum_decode_len_square += decode_len * decode_len
+                decode_batch_size += 1
+        for req in self.scheduler.waiting:
+            if req.status == RequestStatus.WAITING_FOR_FSM:
+                continue
+            if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if RequestStatus.is_finished(req.status):
+                continue
+            num_prompt_tokens = int(req.num_prompt_tokens)
+            num_computed_tokens = int(req.num_computed_tokens)
+            prefill_rem = num_prompt_tokens - num_computed_tokens
+            if prefill_rem < 0:
+                prefill_rem = 0
+            if prefill_rem > 0:
+                sum_prefill_len += prefill_rem
+                sum_prefill_len_square += prefill_rem * prefill_rem
+                prefill_batch_size += 1
+                
+        payload = {
+            "t0_ts_monotonic_s": float(now),
+            "running_request_ids_raw": running_request_ids_raw,#ID列表
+            "sum_prefill_len_square": sum_prefill_len_square,
+            "sum_prefill_len": sum_prefill_len,
+            "prefill_batch_size": prefill_batch_size,
+            "sum_decode_len_square": sum_decode_len_square,
+            "sum_decode_len": sum_decode_len,
+            "decode_batch_size": decode_batch_size,
+        }
+        with open(self._running_snapshot_path, "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.write("\n")
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()

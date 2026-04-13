@@ -80,6 +80,7 @@ from .qwen2_5_vl import (Qwen2_5_VisionAttention,
                          Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLVideoInputs,
                          Qwen2_5_VLVideoPixelInputs)
 from .qwen2_vl import Qwen2VLProcessingInfo
+from .mm_prune_config import get_mm_prune_config
 from .qwen3 import Qwen3ForCausalLM, Qwen3Model
 from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     maybe_prefix, merge_multimodal_embeddings)
@@ -1287,7 +1288,9 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def _process_image_input(
             self,
-            image_input: Qwen2_5_VLImageInputs) -> tuple[torch.Tensor, ...]:
+            image_input: Qwen2_5_VLImageInputs,
+            budget_prune_ratio: Optional[float] = None) \
+            -> tuple[torch.Tensor, ...]:
 
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
@@ -1311,7 +1314,20 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         merge_size = self.visual.spatial_merge_size
         sizes = (torch.tensor(grid_thw_list, dtype=torch.long).prod(-1) //
                  (merge_size * merge_size)).tolist()
-        return image_embeds.split(sizes)
+        parts = image_embeds.split(sizes)
+        if budget_prune_ratio is None:
+            budget_prune_ratio = get_mm_prune_config().prune_ratio
+
+        if budget_prune_ratio is not None and 0.0 < budget_prune_ratio < 1.0:
+            pruned = []
+            for part in parts:
+                keep = max(1, int(part.shape[0] * (1.0 - budget_prune_ratio)))
+                # Uniform subsampling to preserve spatial distribution
+                idx = torch.linspace(0, part.shape[0] - 1, keep,
+                                     dtype=torch.long, device=part.device)
+                pruned.append(part[idx])
+            return tuple(pruned)
+        return parts
 
     def _process_video_input(
             self,
@@ -1361,6 +1377,11 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
     def get_multimodal_embeddings(
             self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
 
+        _ratio = kwargs.pop("budget_prune_ratio", None)
+        budget_prune_ratio = (
+            float(_ratio)
+            if isinstance(_ratio, (int, float)) else None
+        )
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(
             **kwargs)
         if not mm_input_by_modality:
@@ -1375,7 +1396,10 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         for modality in mm_input_by_modality:
             multimodal_input = mm_input_by_modality[modality]
             if modality == "image":
-                vision_embeddings = self._process_image_input(multimodal_input)
+                vision_embeddings = self._process_image_input(
+                    multimodal_input,
+                    budget_prune_ratio=budget_prune_ratio,
+                )
                 multimodal_embeddings += vision_embeddings
             if modality == "video":
                 video_embeddings = self._process_video_input(multimodal_input)
@@ -1447,7 +1471,13 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         input_ids: torch.Tensor,
         image_input: Optional[Qwen2_5_VLImageInputs] = None,
         video_input: Optional[Qwen2_5_VLVideoInputs] = None,
+        **kwargs: object,
     ) -> torch.Tensor:
+        _ratio = kwargs.pop("budget_prune_ratio", None)
+        budget_prune_ratio = (
+            float(_ratio)
+            if isinstance(_ratio, (int, float)) else None
+        )
         inputs_embeds = self.get_input_embeddings(input_ids)
 
         if self.use_deepstack:
@@ -1459,7 +1489,8 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                         1, self.deepstack_num_level, 1).flatten(1)
 
         if image_input is not None:
-            image_embeds = self._process_image_input(image_input)
+            image_embeds = self._process_image_input(
+                image_input, budget_prune_ratio=budget_prune_ratio)
             if self.use_deepstack:
                 image_embeds = torch.cat(image_embeds)
 
@@ -1563,7 +1594,8 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 inputs_embeds = self.get_input_embeddings_v0(
                     input_ids,
                     image_input=image_input,
-                    video_input=video_input)
+                    video_input=video_input,
+                    **kwargs)
                 input_ids = None
 
         if self.use_deepstack and inputs_embeds is not None and get_pp_group(

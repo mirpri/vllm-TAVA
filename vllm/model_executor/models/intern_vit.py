@@ -7,6 +7,7 @@
 # Copyright (c) 2023 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+import os
 from collections.abc import Iterable
 from functools import partial
 from typing import Optional
@@ -35,6 +36,8 @@ NORM2FN = {
     'rms_norm': RMSNorm,
     'layer_norm': nn.LayerNorm,
 }
+_MM_CLS2PATCH_ANYRES_PRUNE_ENV = (
+    os.getenv("VLLM_MM_CLS2PATCH_ANYRES_PRUNE", "0") == "1")
 
 
 class InternVisionEmbeddings(nn.Module):
@@ -358,11 +361,48 @@ class InternVisionEncoder(nn.Module):
                                      use_data_parallel=use_data_parallel)
             for layer_idx in range(num_hidden_layers)
         ])
+        self._mm_last_cls2patch = None
+
+    def _compute_cls2patch(
+        self,
+        encoder_layer: InternVisionEncoderLayer,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        normed_states = encoder_layer.norm1(hidden_states)
+        qkv_states, _ = encoder_layer.attn.qkv(normed_states)
+        query_states, key_states, _ = qkv_states.chunk(3, dim=-1)
+
+        if encoder_layer.attn.qk_normalization:
+            query_states, key_states = encoder_layer.attn._apply_qk_norm(
+                query_states,
+                key_states,
+            )
+
+        bsz, seq_len, _ = query_states.shape
+        num_heads = encoder_layer.attn.num_heads_per_partition
+        head_dim = encoder_layer.attn.head_dim
+        query_states = query_states.view(
+            bsz, seq_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, seq_len, num_heads, head_dim).transpose(1, 2)
+        q_cls = query_states[:, :, 0:1, :]
+        attn_logits = torch.matmul(q_cls, key_states.transpose(-2, -1)).squeeze(2)
+        attn_logits = attn_logits * encoder_layer.attn.scale
+        attn_probs = torch.softmax(attn_logits.float(), dim=-1)
+        cls2patch = attn_probs[:, :, 1:]
+        return cls2patch.mean(dim=1)
 
     def forward(self, inputs_embeds: torch.Tensor):
 
         hidden_states = inputs_embeds
-        for encoder_layer in self.layers:
+        self._mm_last_cls2patch = None
+        target_layer_idx = len(self.layers) - 1
+        for layer_idx, encoder_layer in enumerate(self.layers):
+            if _MM_CLS2PATCH_ANYRES_PRUNE_ENV and layer_idx == target_layer_idx:
+                self._mm_last_cls2patch = self._compute_cls2patch(
+                    encoder_layer,
+                    hidden_states,
+                )
             hidden_states = encoder_layer(hidden_states)
 
         return hidden_states
@@ -398,6 +438,7 @@ class InternVisionModel(nn.Module):
             prefix=f"{prefix}.encoder",
             use_data_parallel=use_data_parallel,
         )
+        self._mm_last_cls2patch = None
 
     def get_input_embeddings(self):
         return self.embeddings
@@ -425,6 +466,11 @@ class InternVisionModel(nn.Module):
                 hidden_states, self.encoder)
         else:
             encoder_outputs = self.encoder(inputs_embeds=hidden_states)
+        self._mm_last_cls2patch = getattr(
+            self.encoder,
+            "_mm_last_cls2patch",
+            None,
+        )
 
         return encoder_outputs
 

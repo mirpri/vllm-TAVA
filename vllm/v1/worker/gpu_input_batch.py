@@ -44,6 +44,7 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
     prompt_embeds: Optional[torch.Tensor] = None
+    mm_trace: bool = False
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(

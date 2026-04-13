@@ -16,6 +16,8 @@ from vllm.multimodal.cache import processor_cache_from_config
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.multimodal.utils import argsort_mm_positions
+from vllm.mm_trace import (extract_mm_processor_kwargs, is_env_enabled,
+                           parse_mm_trace_kwargs, reset_mm_trace, set_mm_trace)
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -370,15 +372,51 @@ class Processor:
             else:
                 mm_uuids = None
 
+        mm_trace_token = None
+        mm_trace_active = False
+        mm_trace_forced_grid = None
+        mm_trace_forced_total = None
+        if is_env_enabled():
+            mm_kwargs = extract_mm_processor_kwargs(prompt)
+            trace_enabled, forced_grid, forced_total = \
+                parse_mm_trace_kwargs(mm_kwargs)
+            if trace_enabled:
+                mm_trace_token = set_mm_trace(request_id, mm_kwargs)
+                mm_trace_active = mm_trace_token is not None
+                mm_trace_forced_grid = forced_grid
+                mm_trace_forced_total = forced_total
+                mm_keys = ""
+                if isinstance(mm_kwargs, Mapping):
+                    mm_keys = ",".join(sorted(mm_kwargs.keys()))
+                logger.info(
+                    "[MMTrace] request_start request_id=%s mm_keys=%s "
+                    "forced_grid=%s forced_total_patches=%s",
+                    request_id,
+                    mm_keys,
+                    forced_grid,
+                    forced_total,
+                )
+
         # Process inputs, which includes:
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
         #   multimodal data and expand prompt token ids accordingly.
-        processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
-            prompt,
-            tokenization_kwargs=tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
+        if mm_trace_token is not None:
+            try:
+                processed_inputs: ProcessorInputs = \
+                    self.input_preprocessor.preprocess(
+                        prompt,
+                        tokenization_kwargs=tokenization_kwargs,
+                        mm_uuids=mm_uuids,
+                    )
+            finally:
+                reset_mm_trace(mm_trace_token)
+        else:
+            processed_inputs = self.input_preprocessor.preprocess(
+                prompt,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
         from vllm.platforms import current_platform
         current_platform.validate_request(
             prompt=prompt,
@@ -417,6 +455,20 @@ class Processor:
                 self.generation_config_fields, eos_token_id)
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
+            extra_args = sampling_params.extra_args
+            if isinstance(extra_args, dict):
+                mm_apply = extra_args.get("mm_relevance_apply")
+                mm_query = extra_args.get("mm_relevance_query")
+                if mm_apply and isinstance(mm_query, str) \
+                        and self.tokenizer is not None:
+                    # Tokenize relevance query without touching the prompt.
+                    token_ids = self.tokenizer.encode(
+                        mm_query, add_special_tokens=False)
+                    extra_args["mm_relevance_query_token_ids"] = [
+                        int(tid) for tid in token_ids
+                    ]
+                if "mm_relevance_query" in extra_args:
+                    extra_args.pop("mm_relevance_query", None)
         else:
             pooling_params = params.clone()
 
@@ -442,11 +494,50 @@ class Processor:
                         identifier=decoder_mm_hashes[modality][idx],
                         mm_position=decoder_mm_positions[modality][idx]))
 
+        if mm_trace_active and decoder_inputs["type"] == "multimodal":
+            placeholders = decoder_inputs["mm_placeholders"]
+            hashes = decoder_inputs["mm_hashes"]
+            total_mm_tokens = 0
+            total_mm_items = 0
+            for modality, ranges in placeholders.items():
+                lengths = [r.length for r in ranges]
+                offsets = [r.offset for r in ranges]
+                total_mm_tokens += sum(lengths)
+                total_mm_items += len(ranges)
+                hashes_mod = hashes.get(modality, [])
+                hash_prefixes = [h[:8] for h in hashes_mod]
+                logger.info(
+                    "[MMTrace] placeholders request_id=%s modality=%s "
+                    "count=%s lengths=%s offsets=%s hashes=%s",
+                    request_id,
+                    modality,
+                    len(ranges),
+                    lengths,
+                    offsets,
+                    ",".join(hash_prefixes),
+                )
+            prompt_len = length_from_prompt_token_ids_or_embeds(
+                prompt_token_ids, prompt_embeds)
+            text_tokens = prompt_len - total_mm_tokens
+            logger.info(
+                "[MMTrace] request_mm_summary request_id=%s prompt_len=%s "
+                "text_tokens=%s mm_total=%s mm_items=%s forced_grid=%s "
+                "forced_total_patches=%s",
+                request_id,
+                prompt_len,
+                text_tokens,
+                total_mm_tokens,
+                total_mm_items,
+                mm_trace_forced_grid,
+                mm_trace_forced_total,
+            )
+
         return prompt_str, EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
             mm_features=mm_features,
+            mm_trace=mm_trace_active,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
             eos_token_id=eos_token_id,

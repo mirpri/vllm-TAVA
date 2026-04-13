@@ -7,6 +7,7 @@
 # Copyright (c) 2023 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+import math
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
@@ -15,35 +16,60 @@ from typing import Annotated, Any, Literal, Optional, TypeVar, Union
 import numpy.typing as npt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 from transformers import BatchEncoding, PretrainedConfig, TensorType
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
-from vllm.model_executor.models.intern_vit import (InternVisionModel,
-                                                   InternVisionPatchModel)
+from vllm.model_executor.models.intern_vit import (
+    InternVisionModel,
+    InternVisionPatchModel,
+)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.image import convert_image_mode
-from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
-                                    MultiModalKwargsItems, NestedTensors)
-from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
-                                   ImageSize, MultiModalDataItems)
-from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        BaseProcessingInfo, PromptReplacement,
-                                        PromptUpdate, PromptUpdateDetails)
+from vllm.multimodal.inputs import (
+    MultiModalDataDict,
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+    NestedTensors,
+)
+from vllm.multimodal.parse import (
+    ImageEmbeddingItems,
+    ImageProcessorItems,
+    ImageSize,
+    MultiModalDataItems,
+)
+from vllm.multimodal.processing import (
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    PromptReplacement,
+    PromptUpdate,
+    PromptUpdateDetails,
+)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import set_default_torch_num_threads
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
-                         SupportsMultiModal, SupportsPP)
-from .utils import (AutoWeightsLoader, flatten_bn, init_vllm_registered_model,
-                    maybe_prefix, merge_multimodal_embeddings)
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
+from .utils import (
+    AutoWeightsLoader,
+    flatten_bn,
+    init_vllm_registered_model,
+    maybe_prefix,
+    merge_multimodal_embeddings,
+)
 
 IMG_START = '<img>'
 IMG_END = '</img>'
@@ -51,6 +77,140 @@ IMG_CONTEXT = '<IMG_CONTEXT>'
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+logger = init_logger(__name__)
+
+DEBUG = os.getenv("INTERNVL_DEBUG") == "1"
+_MM_CLS2PATCH_ANYRES_PRUNE_ENV = (
+    os.getenv("VLLM_MM_CLS2PATCH_ANYRES_PRUNE", "0") == "1")
+
+
+def _get_mm_cls2patch_topk() -> int:
+    text = os.getenv("VLLM_MM_CLS2PATCH_TOPK", "0")
+    try:
+        value = int(text)
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
+def _get_mm_cls2patch_tiles_topp() -> float:
+    text = os.getenv("VLLM_MM_CLS2PATCH_TILES_TOPP", "")
+    if not text:
+        return 1.0
+    try:
+        value = float(text)
+    except ValueError:
+        return 1.0
+    if value <= 0:
+        return 0.0
+    return min(value, 1.0)
+
+
+def _get_mm_prune_score_mode() -> str:
+    text = os.getenv("VLLM_MM_PRUNE_SCORE_MODE", "cls2patch")
+    mode = text.strip().lower() if text else "cls2patch"
+    if mode not in ("cls2patch", "relevance", "fusion"):
+        _append_info_log(f"[MMPrune] unknown score mode={mode}, fallback to cls2patch")
+        return "cls2patch"
+    return mode
+
+
+def _get_mm_prune_fusion_alpha() -> float:
+    text = os.getenv("VLLM_MM_PRUNE_FUSION_ALPHA", "0.5")
+    try:
+        value = float(text)
+    except ValueError:
+        return 0.5
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+def _get_mm_anyres_budget_mode() -> str:
+    text = os.getenv("VLLM_MM_ANYRES_BUDGET_MODE", "default")
+    mode = text.strip().lower() if text else "default"
+    if mode not in ("default", "relevance"):
+        _append_info_log(f"[MMAnyresBudget] unknown mode={mode}, fallback to default")
+        return "default"
+    return mode
+
+
+def _get_mm_anyres_image_prune_ratio() -> Optional[float]:
+    text = os.getenv("VLLM_MM_ANYRES_IMAGE_PRUNE_RATIO", "")
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+def _get_request_prune_ratio(
+    hf_processor_mm_kwargs: Optional[Mapping[str, object]],
+) -> Optional[float]:
+    if not hf_processor_mm_kwargs or "prune_ratio" not in hf_processor_mm_kwargs:
+        return None
+    raw_value = hf_processor_mm_kwargs["prune_ratio"]
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid request prune_ratio in mm_processor_kwargs: {raw_value!r}"
+        ) from exc
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(
+            f"Request prune_ratio out of range in mm_processor_kwargs: {value}"
+        )
+    return value
+
+
+def _filter_processor_init_kwargs(kwargs: Mapping[str, object]) -> dict[str, object]:
+    filtered = dict(kwargs)
+    filtered.pop("prune_ratio", None)
+    return filtered
+
+
+def _get_mm_anyres_zone_budget_tau() -> float:
+    text = os.getenv("VLLM_MM_ANYRES_ZONE_BUDGET_TAU", "1.0")
+    try:
+        value = float(text)
+    except ValueError:
+        return 1.0
+    if value <= 0.0:
+        return 1.0
+    return value
+
+
+def _get_mm_anyres_budget_log_enabled() -> bool:
+    return os.getenv("VLLM_MM_ANYRES_BUDGET_LOG", "0") == "1"
+
+
+def _get_mm_prune_log_file() -> Optional[str]:
+    path = os.getenv("VLLM_MM_PRUNE_LOG_FILE", "./mm_prune_log.txt")
+    return path if path else None
+
+
+def _append_prune_log(line: str) -> None:
+    path = _get_mm_prune_log_file()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Do not break runtime on log failures.
+        pass
+
+def _append_info_log(line: str) -> None:
+    _append_prune_log(f"[INFO!] {line}")
+    logger.info(line)
 
 
 class InternVLImagePixelInputs(TensorSchema):
@@ -65,6 +225,7 @@ class InternVLImagePixelInputs(TensorSchema):
     type: Literal["pixel_values"]
     pixel_values_flat: Annotated[torch.Tensor, TensorShape("bnp", 3, "h", "w")]
     num_patches: Annotated[torch.Tensor, TensorShape("bn")]
+    image_sizes: Annotated[Optional[torch.Tensor], TensorShape("bn", 2)]
 
 
 class InternVLImageEmbeddingInputs(TensorSchema):
@@ -186,7 +347,9 @@ def get_internvl_target_ratios(
                      for n in range(min_num, max_num + 1)
                      for i in range(1, n + 1)
                      for j in range(1, n + 1) if min_num <= i * j <= max_num}
-    return sorted(target_ratios, key=lambda x: x[0] * x[1])
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+    print("[internvl] target ratios max_num", max_num)
+    return target_ratios
 
 
 def calculate_internvl_targets(
@@ -216,6 +379,9 @@ def calculate_internvl_targets(
     # add thumbnail image if num_blocks != 1
     if use_thumbnail and blocks != 1:
         blocks += 1
+    
+    print("[internvl] original size:", orig_width, orig_height)
+    print("[internvl] calculated size:", blocks, target_aspect_ratio[0], target_aspect_ratio[1])
 
     return blocks, target_width, target_height
 
@@ -410,7 +576,7 @@ class BaseInternVLProcessor(ABC):
 
         return get_internvl_target_ratios(min_num, max_num)
 
-    def get_num_image_tokens(
+    def _get_num_image_tokens_unpruned(
         self,
         *,
         image_width: int,
@@ -429,6 +595,57 @@ class BaseInternVLProcessor(ABC):
         )
 
         return num_patches * self.num_image_token
+
+    def get_num_image_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        hf_processor_mm_kwargs: Optional[Mapping[str, object]] = None,
+    ) -> int:
+        target_ratios = self.resolve_target_ratios(
+            use_thumbnail=False,  # Applied in calculate_targets
+        )
+
+        num_patches, _, _ = calculate_internvl_targets(
+            orig_width=image_width,
+            orig_height=image_height,
+            image_size=self.image_size,
+            target_ratios=target_ratios,
+            use_thumbnail=self.use_thumbnail,
+        )
+        tokens_per_patch = self.num_image_token
+        total_tokens = num_patches * tokens_per_patch
+        if not _MM_CLS2PATCH_ANYRES_PRUNE_ENV:
+            return total_tokens
+
+        budget_mode = _get_mm_anyres_budget_mode()
+        if budget_mode == "relevance":
+            prune_ratio = _get_request_prune_ratio(hf_processor_mm_kwargs)
+            if prune_ratio is None:
+                prune_ratio = _get_mm_anyres_image_prune_ratio()
+            if prune_ratio is None:
+                msg = ("[MMAnyresBudget] get_num_image_tokens missing "
+                       "request prune_ratio and "
+                       "VLLM_MM_ANYRES_IMAGE_PRUNE_RATIO "
+                       f"image=({image_height},{image_width})")
+                _append_info_log(msg)
+                raise ValueError(msg)
+            keep_tokens = int(math.floor(total_tokens * (1.0 - prune_ratio)))
+            keep_tokens = max(0, min(total_tokens, keep_tokens))
+            return keep_tokens
+
+        topk = _get_mm_cls2patch_topk()
+        if topk > 0:
+            tiles_topp = _get_mm_cls2patch_tiles_topp()
+            k_thumb = min(topk, tokens_per_patch)
+            k_other = int(math.ceil(tokens_per_patch * tiles_topp))
+            k_other = max(0, min(tokens_per_patch, k_other))
+            if self.use_thumbnail and num_patches > 1:
+                return k_thumb + k_other * (num_patches - 1)
+            return k_thumb + k_other * (num_patches - 1)
+
+        return total_tokens
 
     def _images_to_pixel_values_lst(
         self,
@@ -461,6 +678,7 @@ class BaseInternVLProcessor(ABC):
         min_dynamic_patch: Optional[int] = None,
         max_dynamic_patch: Optional[int] = None,
         dynamic_image_size: Optional[bool] = None,
+        prune_ratio: Optional[float] = None,
     ) -> tuple[list[str], dict[str, torch.Tensor]]:
         if len(images) == 0:
             image_inputs = {}
@@ -476,11 +694,21 @@ class BaseInternVLProcessor(ABC):
                 torch.cat(pixel_values_lst),
                 "image_num_patches":
                 torch.tensor([len(item) for item in pixel_values_lst]),
+                "image_sizes":
+                torch.tensor([[img.size[1], img.size[0]] for img in images]),
             }
 
-            for pixel_values in pixel_values_lst:
+            for image_idx, pixel_values in enumerate(pixel_values_lst):
                 num_patches = pixel_values.shape[0]
-                feature_size = num_patches * self.num_image_token
+                image_width, image_height = images[image_idx].size
+                mm_kwargs = None if prune_ratio is None else {
+                    "prune_ratio": prune_ratio
+                }
+                feature_size = self.get_num_image_tokens(
+                    image_width=image_width,
+                    image_height=image_height,
+                    hf_processor_mm_kwargs=mm_kwargs,
+                )
 
                 image_repl = self.get_image_repl(feature_size, num_patches)
                 text = [t.replace('<image>', image_repl.full, 1) for t in text]
@@ -501,6 +729,7 @@ class BaseInternVLProcessor(ABC):
         min_dynamic_patch: Optional[int] = None,
         max_dynamic_patch: Optional[int] = None,
         dynamic_image_size: Optional[bool] = None,
+        prune_ratio: Optional[float] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
     ) -> Mapping[str, NestedTensors]:
         text, images = [self._make_batch_input(x) for x in (text, images)]
@@ -511,6 +740,7 @@ class BaseInternVLProcessor(ABC):
             min_dynamic_patch=min_dynamic_patch,
             max_dynamic_patch=max_dynamic_patch,
             dynamic_image_size=dynamic_image_size,
+            prune_ratio=prune_ratio,
         )
 
         text_inputs = self.tokenizer(text)
@@ -621,6 +851,7 @@ class InternVLProcessor(BaseInternVLProcessor):
         min_dynamic_patch: Optional[int] = None,
         max_dynamic_patch: Optional[int] = None,
         dynamic_image_size: Optional[bool] = None,
+        prune_ratio: Optional[float] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
     ) -> Mapping[str, NestedTensors]:
         text, images, videos = [
@@ -633,6 +864,7 @@ class InternVLProcessor(BaseInternVLProcessor):
             min_dynamic_patch=min_dynamic_patch,
             max_dynamic_patch=max_dynamic_patch,
             dynamic_image_size=dynamic_image_size,
+            prune_ratio=prune_ratio,
         )
 
         text, video_inputs = self._preprocess_video(
@@ -690,14 +922,16 @@ class BaseInternVLProcessingInfo(BaseProcessingInfo):
         *,
         image_width: int,
         image_height: int,
-        processor: Optional[BaseInternVLProcessor],
+        processor: Optional[BaseInternVLProcessor] = None,
+        hf_processor_mm_kwargs: Optional[Mapping[str, object]] = None,
     ) -> int:
         if processor is None:
-            processor = self.get_hf_processor()
+            processor = self.get_hf_processor(**(hf_processor_mm_kwargs or {}))
 
         return processor.get_num_image_tokens(
             image_width=image_width,
             image_height=image_height,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
         )
 
     def get_image_size_with_most_features(self) -> ImageSize:
@@ -710,10 +944,9 @@ class BaseInternVLProcessingInfo(BaseProcessingInfo):
         for wr, hr in target_ratios:
             width, height = base_size * wr, base_size * hr
 
-            feat_size = self.get_num_image_tokens(
+            feat_size = processor._get_num_image_tokens_unpruned(
                 image_width=width,
                 image_height=height,
-                processor=processor,
             )
             if feat_size > largest_feature_size:
                 largest_feature_size = feat_size
@@ -729,10 +962,9 @@ class BaseInternVLProcessingInfo(BaseProcessingInfo):
         processor = self.get_hf_processor()
         target_width, target_height = self.get_image_size_with_most_features()
 
-        return self.get_num_image_tokens(
+        return processor._get_num_image_tokens_unpruned(
             image_width=target_width,
             image_height=target_height,
-            processor=processor,
         )
 
 
@@ -803,6 +1035,7 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
             pixel_values_flat=MultiModalFieldConfig.flat_from_sizes(
                 "image", image_num_patches),
             image_num_patches=MultiModalFieldConfig.batched("image"),
+            image_sizes=MultiModalFieldConfig.batched("image"),
             image_embeds=MultiModalFieldConfig.batched("image"),
             image_token_id=MultiModalFieldConfig.shared("image", num_images),
         )
@@ -839,6 +1072,7 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
                     image_width=image_size.width,
                     image_height=image_size.height,
                     processor=hf_processor,
+                    hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 )
 
             num_patches = image_num_patches[item_idx]
@@ -900,7 +1134,7 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
             config=self.get_hf_config(),
             tokenizer=self.get_tokenizer(),
             video_token=self.get_video_token(),
-            **kwargs,
+            **_filter_processor_init_kwargs(kwargs),
         )
 
 
@@ -1169,6 +1403,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             self, **kwargs: object) -> Optional[InternVLImageInputs]:
         pixel_values_flat = kwargs.pop("pixel_values_flat", None)
         image_num_patches = kwargs.pop("image_num_patches", None)
+        image_sizes = kwargs.pop("image_sizes", None)
         image_embeds = kwargs.pop("image_embeds", None)
 
         if pixel_values_flat is None and image_embeds is None:
@@ -1196,9 +1431,15 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             if not isinstance(image_num_patches, (torch.Tensor, list)):
                 raise ValueError("Incorrect type of image_num_patches. "
                                  f"Got type: {type(image_num_patches)}")
+            if image_sizes is not None and not isinstance(
+                    image_sizes, (torch.Tensor, list)):
+                raise ValueError("Incorrect type of image_sizes. "
+                                 f"Got type: {type(image_sizes)}")
 
             pixel_values_flat = flatten_bn(pixel_values_flat, concat=True)
             image_num_patches = flatten_bn(image_num_patches, concat=True)
+            if image_sizes is not None:
+                image_sizes = flatten_bn(image_sizes, concat=True)
             expected_h = expected_w = self.config.vision_config.image_size
             resolve_bindings = {"h": expected_h, "w": expected_w}
 
@@ -1206,6 +1447,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
                 type="pixel_values",
                 pixel_values_flat=pixel_values_flat,
                 num_patches=image_num_patches,
+                image_sizes=image_sizes,
                 resolve_bindings=resolve_bindings,
             )
 
@@ -1257,30 +1499,380 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
     def _process_image_input(
         self,
         image_input: Union[InternVLImageInputs, InternVLVideoPixelInputs],
+        relevance_text_embed: Optional[torch.Tensor] = None,
+        relevance_apply: Optional[torch.Tensor] = None,
+        budget_prune_ratios_override: Optional[list[Optional[float]]] = None,
     ) -> tuple[torch.Tensor, ...]:
         if image_input["type"] == "image_embeds":
+            if budget_prune_ratios_override is not None \
+                    and len(budget_prune_ratios_override) != len(image_input["data"]):
+                raise RuntimeError(
+                    "Per-request prune ratio count must match multimodal batch size: "
+                    f"ratios={len(budget_prune_ratios_override)} "
+                    f"items={len(image_input['data'])}"
+                )
             return image_input["data"]
 
         assert self.vision_model is not None
 
         image_embeds = self.extract_feature(image_input["pixel_values_flat"])
-
         num_patches = image_input["num_patches"]
+        image_sizes = image_input.get("image_sizes")
+        hidden_size = self.config.text_config.hidden_size
+        tokens_per_patch = image_embeds.shape[1]
 
-        # Only one image in the current batch
-        if len(num_patches) == 1:
-            return (image_embeds.view(-1,
-                                      self.config.text_config.hidden_size), )
+        anyres_prune_enabled = (
+            image_input["type"] == "pixel_values"
+            and _MM_CLS2PATCH_ANYRES_PRUNE_ENV
+        )
+        cls2patch_topk = _get_mm_cls2patch_topk()
+        tiles_topp = _get_mm_cls2patch_tiles_topp()
+        budget_mode = _get_mm_anyres_budget_mode()
+        default_budget_prune_ratio = _get_mm_anyres_image_prune_ratio()
+        budget_tau = _get_mm_anyres_zone_budget_tau()
+        budget_log_enabled = _get_mm_anyres_budget_log_enabled()
+        score_mode = _get_mm_prune_score_mode()
+        fusion_alpha = _get_mm_prune_fusion_alpha()
 
-        # NOTE: Image embeddings are split into separate tensors for each image
-        # by the size of each embedding.
-        feature_size = image_embeds.shape[1]
-        image_embeds = image_embeds.view(-1,
-                                         self.config.text_config.hidden_size)
-        image_feature_sizes = [
-            num_patches * feature_size for num_patches in num_patches
-        ]
-        return image_embeds.split(image_feature_sizes)
+        if budget_prune_ratios_override is not None \
+                and len(budget_prune_ratios_override) != len(num_patches):
+            raise RuntimeError(
+                "Per-request prune ratio count must match multimodal batch size: "
+                f"ratios={len(budget_prune_ratios_override)} "
+                f"items={len(num_patches)}"
+            )
+
+        print(f"\n[MMTopK] anyres_prune_enabled={anyres_prune_enabled}\n"
+              f"cls2patch_topk={cls2patch_topk} tiles_topp={tiles_topp}\n"
+              f"budget_mode={budget_mode} "
+              f"default_budget_prune_ratio={default_budget_prune_ratio}\n"
+              f"budget_tau={budget_tau} score_mode={score_mode}\n"
+              f"fusion_alpha={fusion_alpha}\n")
+
+        cls2patch = None
+        if anyres_prune_enabled and (budget_mode == "relevance"
+                                     or cls2patch_topk > 0):
+            encoder = getattr(self.vision_model, "encoder", None)
+            if encoder is not None:
+                cls2patch = getattr(encoder, "_mm_last_cls2patch", None)
+            if cls2patch is None:
+                cls2patch = getattr(self.vision_model, "_mm_last_cls2patch",
+                                    None)
+
+        def _minmax_norm(scores: torch.Tensor) -> torch.Tensor:
+            min_val = scores.min(dim=-1, keepdim=True).values
+            max_val = scores.max(dim=-1, keepdim=True).values
+            denom = (max_val - min_val).clamp_min(1e-6)
+            return (scores - min_val) / denom
+        def _downsample_cls2patch(scores: torch.Tensor,
+                                  target_len: int) -> torch.Tensor:
+            grid_len = self.config.vision_config.image_size // \
+                self.config.vision_config.patch_size
+            expected = grid_len * grid_len
+            if scores.shape[1] != expected:
+                msg = (
+                    f"[MMTopK] internvl img_idx={img_idx} "
+                    f"cls2patch_len={scores.shape[1]} expected={expected}")
+                _append_info_log(msg)
+                raise ValueError(msg)
+            scale = int(round(1.0 / self.downsample_ratio))
+            if scale <= 0 or grid_len % scale != 0:
+                msg = (
+                    f"[MMTopK] internvl img_idx={img_idx} "
+                    f"invalid downsample_ratio={self.downsample_ratio}")
+                _append_info_log(msg)
+                raise ValueError(msg)
+            scores_2d = scores.view(-1, grid_len, grid_len)
+            pooled = F.avg_pool2d(scores_2d.unsqueeze(1),
+                                  kernel_size=scale,
+                                  stride=scale).squeeze(1)
+            flat = pooled.reshape(scores.shape[0], -1)
+            if flat.shape[1] != target_len:
+                msg = (
+                    f"[MMTopK] internvl img_idx={img_idx} "
+                    f"downsampled_len={flat.shape[1]} expected={target_len}")
+                raise ValueError(msg)
+            return flat
+
+        outputs: list[torch.Tensor] = []
+        patch_offset = 0
+        for img_idx in range(len(num_patches)):
+            budget_prune_ratio = default_budget_prune_ratio
+            if budget_prune_ratios_override is not None:
+                request_ratio = budget_prune_ratios_override[img_idx]
+                if request_ratio is not None:
+                    budget_prune_ratio = float(request_ratio)
+            patch_count = num_patches[img_idx]
+            if isinstance(patch_count, torch.Tensor):
+                num_patches_i = int(patch_count.item())
+            else:
+                num_patches_i = int(patch_count)
+            patch_slice = image_embeds[patch_offset:patch_offset + num_patches_i]
+            patch_offset += num_patches_i
+
+            merged = patch_slice.reshape(-1, hidden_size)
+            total_tokens = merged.shape[0]
+            if (not anyres_prune_enabled
+                    or (budget_mode != "relevance" and cls2patch_topk <= 0)):
+                outputs.append(merged)
+                if image_sizes is not None and isinstance(image_sizes,
+                                                         torch.Tensor) \
+                        and image_sizes.numel() >= (img_idx + 1) * 2:
+                    orig_h, orig_w = image_sizes[img_idx].tolist()
+                else:
+                    orig_h, orig_w = -1, -1
+                _append_prune_log(
+                    "model=internvl "
+                    f"img_idx={img_idx} orig={orig_w}x{orig_h} "
+                    f"blocks={num_patches_i} tokens_per_block={tokens_per_patch} "
+                    f"total_tokens={total_tokens} kept_tokens={total_tokens} "
+                    f"budget_mode={budget_mode} score_mode={score_mode} "
+                    f"topk={cls2patch_topk} topp={tiles_topp} "
+                    f"prune_ratio={budget_prune_ratio} "
+                    f"fusion_alpha={fusion_alpha} "
+                    f"use_thumbnail={self.config.use_thumbnail}")
+                continue
+
+            relevance_img = None
+            if (budget_mode == "relevance"
+                    or score_mode in ("relevance", "fusion")) \
+                    and isinstance(relevance_text_embed, torch.Tensor):
+                apply_relevance = True
+                if relevance_apply is not None:
+                    if isinstance(relevance_apply, torch.Tensor):
+                        apply_relevance = bool(
+                            relevance_apply[img_idx].item()) \
+                            if relevance_apply.numel() > img_idx else False
+                    else:
+                        apply_relevance = bool(relevance_apply)
+                if apply_relevance and relevance_text_embed.shape[0] > img_idx:
+                    text_vec = F.normalize(relevance_text_embed[img_idx],
+                                           dim=-1)
+                    patch_norm = F.normalize(patch_slice, dim=-1)
+                    relevance_img = torch.matmul(patch_norm, text_vec)
+
+            cls2patch_img = None
+            if isinstance(cls2patch, torch.Tensor) and cls2patch.dim() == 2:
+                cls2patch_img = cls2patch[
+                    patch_offset - num_patches_i:patch_offset
+                ]
+                if cls2patch_img.shape[1] != tokens_per_patch:
+                    cls2patch_img = _downsample_cls2patch(
+                        cls2patch_img, tokens_per_patch)
+            if budget_mode == "relevance" and relevance_img is None:
+                msg = (
+                    f"[MMAnyresBudget] internvl img_idx={img_idx} "
+                    "missing relevance_text_embed or apply flag")
+                _append_info_log(msg)
+                raise ValueError(msg)
+            score_img = None
+            if score_mode == "cls2patch":
+                if cls2patch_img is None:
+                    msg = (
+                        f"[MMTopK] internvl img_idx={img_idx} "
+                        "missing cls2patch for score_mode=cls2patch")
+                    _append_info_log(msg)
+                    raise ValueError(msg)
+                score_img = cls2patch_img
+            elif score_mode == "relevance":
+                if relevance_img is None:
+                    msg = (
+                        f"[MMTopK] internvl img_idx={img_idx} "
+                        "missing relevance scores for score_mode=relevance")
+                    _append_info_log(msg)
+                    raise ValueError(msg)
+                score_img = relevance_img
+            elif score_mode == "fusion":
+                if relevance_img is None or cls2patch_img is None:
+                    msg = (
+                        f"[MMTopK] internvl img_idx={img_idx} "
+                        "missing cls2patch/relevance for score_mode=fusion")
+                    _append_info_log(msg)
+                    raise ValueError(msg)
+                score_img = fusion_alpha * _minmax_norm(cls2patch_img) \
+                    + (1.0 - fusion_alpha) * _minmax_norm(relevance_img)
+
+            if score_img is None \
+                    or score_img.shape[0] != num_patches_i \
+                    or score_img.shape[1] != tokens_per_patch:
+                rows = 0 if score_img is None else int(score_img.shape[0])
+                cols = 0 if score_img is None else int(score_img.shape[1])
+                msg = (
+                    f"[MMTopK] internvl img_idx={img_idx} "
+                    f"score_shape=({rows},{cols}) expected="
+                    f"({num_patches_i},{tokens_per_patch})")
+                _append_info_log(msg)
+                raise ValueError(msg)
+
+            if budget_mode == "relevance":
+                if budget_prune_ratio is None:
+                    msg = (
+                        f"[MMAnyresBudget] internvl img_idx={img_idx} "
+                        "missing VLLM_MM_ANYRES_IMAGE_PRUNE_RATIO")
+                    _append_info_log(msg)
+                    raise ValueError(msg)
+                keep_image_tokens = int(
+                    math.floor(total_tokens * (1.0 - budget_prune_ratio)))
+                keep_image_tokens = max(
+                    0, min(total_tokens, keep_image_tokens))
+                if keep_image_tokens <= 0:
+                    outputs.append(merged[:0])
+                    continue
+                zone_means = relevance_img.mean(dim=1)
+                scaled = zone_means / budget_tau
+                scaled = scaled - scaled.max()
+                zone_probs = torch.softmax(scaled, dim=0)
+                zone_probs = zone_probs / zone_probs.sum()
+                expected = zone_probs * keep_image_tokens
+                floors = torch.floor(expected).to(torch.int64)
+                caps = torch.full(
+                    (num_patches_i, ),
+                    tokens_per_patch,
+                    device=floors.device,
+                    dtype=floors.dtype,
+                )
+                budgets = torch.minimum(floors, caps)
+                remaining = int(keep_image_tokens - budgets.sum().item())
+                budgets_list = budgets.detach().cpu().tolist()
+                caps_list = caps.detach().cpu().tolist()
+                if remaining > 0:
+                    zone_probs_list = zone_probs.detach().cpu().tolist()
+                    order = sorted(
+                        range(len(zone_probs_list)),
+                        key=lambda idx: (-zone_probs_list[idx], idx),
+                    )
+                    for idx in order:
+                        if remaining <= 0:
+                            break
+                        capacity = caps_list[idx] - budgets_list[idx]
+                        if capacity <= 0:
+                            continue
+                        add = remaining if remaining < capacity else capacity
+                        budgets_list[idx] += add
+                        remaining -= add
+                elif remaining < 0:
+                    zone_probs_list = zone_probs.detach().cpu().tolist()
+                    order = sorted(
+                        range(len(zone_probs_list)),
+                        key=lambda idx: (zone_probs_list[idx], idx),
+                    )
+                    remaining = -remaining
+                    for idx in order:
+                        if remaining <= 0:
+                            break
+                        reducible = budgets_list[idx]
+                        if reducible <= 0:
+                            continue
+                        sub = remaining if remaining < reducible else reducible
+                        budgets_list[idx] -= sub
+                        remaining -= sub
+                    remaining = -remaining
+                if remaining != 0:
+                    msg = (
+                        f"[MMAnyresBudget] internvl img_idx={img_idx} "
+                        f"budget_allocation_failed remaining={remaining} "
+                        f"keep_image={keep_image_tokens} "
+                        f"cap_sum={sum(caps_list)}")
+                    _append_info_log(msg)
+                    raise ValueError(msg)
+                keep_indices = []
+                for block_idx, k_block in enumerate(budgets_list):
+                    if k_block <= 0:
+                        continue
+                    scores = score_img[block_idx]
+                    by_score = torch.topk(scores, k=int(k_block)).indices
+                    sorted_local, _ = torch.sort(by_score)
+                    merged_idx = block_idx * tokens_per_patch + sorted_local
+                    keep_indices.append(merged_idx)
+                if keep_indices:
+                    keep_idx = torch.cat(keep_indices)
+                    keep_idx, _ = torch.sort(keep_idx)
+                    merged = merged.index_select(0, keep_idx)
+                keep_count = int(merged.shape[0])
+                if budget_log_enabled:
+                    _append_info_log(
+                        "[MMAnyresBudget] internvl "
+                        f"img_idx={img_idx} mode={budget_mode} "
+                        f"total_image={total_tokens} "
+                        f"keep_image={keep_image_tokens} tau={budget_tau}"
+                    )
+                if keep_count != keep_image_tokens:
+                    msg = (
+                        f"[MMAnyresBudget] internvl img_idx={img_idx} "
+                        f"keep_mismatch keep_count={keep_count} "
+                        f"predicted_keep={keep_image_tokens}")
+                    _append_info_log(msg)
+                    raise ValueError(msg)
+                outputs.append(merged)
+                if image_sizes is not None and isinstance(image_sizes,
+                                                         torch.Tensor) \
+                        and image_sizes.numel() >= (img_idx + 1) * 2:
+                    orig_h, orig_w = image_sizes[img_idx].tolist()
+                else:
+                    orig_h, orig_w = -1, -1
+                _append_prune_log(
+                    "model=internvl "
+                    f"img_idx={img_idx} orig={orig_w}x{orig_h} "
+                    f"blocks={num_patches_i} tokens_per_block={tokens_per_patch} "
+                    f"total_tokens={total_tokens} kept_tokens={keep_count} "
+                    f"budget_mode={budget_mode} score_mode={score_mode} "
+                    f"topk={cls2patch_topk} topp={tiles_topp} "
+                    f"prune_ratio={budget_prune_ratio} "
+                    f"fusion_alpha={fusion_alpha} "
+                    f"use_thumbnail={self.config.use_thumbnail}")
+                continue
+            else:
+                keep_indices = []
+                if cls2patch_topk > 0:
+                    k_thumb = min(cls2patch_topk, tokens_per_patch)
+                    k_other = int(math.ceil(tokens_per_patch * tiles_topp))
+                    k_other = max(0, min(tokens_per_patch, k_other))
+                    if self.config.use_thumbnail and num_patches_i > 1:
+                        thumb_idx = num_patches_i - 1
+                    else:
+                        thumb_idx = 0
+                    for block_idx in range(num_patches_i):
+                        k_block = k_thumb if block_idx == thumb_idx else k_other
+                        if k_block <= 0:
+                            continue
+                        scores = score_img[block_idx]
+                        by_score = torch.topk(scores, k=int(k_block)).indices
+                        sorted_local, _ = torch.sort(by_score)
+                        merged_idx = block_idx * tokens_per_patch + sorted_local
+                        keep_indices.append(merged_idx)
+                if keep_indices:
+                    keep_idx = torch.cat(keep_indices)
+                    keep_idx, _ = torch.sort(keep_idx)
+                    merged = merged.index_select(0, keep_idx)
+                keep_count = int(merged.shape[0])
+                if cls2patch_topk > 0:
+                    predicted_keep = k_thumb + k_other * (num_patches_i - 1)
+                    if keep_count != predicted_keep:
+                        msg = (
+                            f"[MMTopK] internvl img_idx={img_idx} "
+                            f"keep_mismatch keep_count={keep_count} "
+                            f"predicted_keep={predicted_keep}")
+                        _append_info_log(msg)
+                        raise ValueError(msg)
+                outputs.append(merged)
+                if image_sizes is not None and isinstance(image_sizes,
+                                                         torch.Tensor) \
+                        and image_sizes.numel() >= (img_idx + 1) * 2:
+                    orig_h, orig_w = image_sizes[img_idx].tolist()
+                else:
+                    orig_h, orig_w = -1, -1
+                _append_prune_log(
+                    "model=internvl "
+                    f"img_idx={img_idx} orig={orig_w}x{orig_h} "
+                    f"blocks={num_patches_i} tokens_per_block={tokens_per_patch} "
+                    f"total_tokens={total_tokens} kept_tokens={keep_count} "
+                    f"budget_mode={budget_mode} score_mode={score_mode} "
+                    f"topk={cls2patch_topk} topp={tiles_topp} "
+                    f"prune_ratio={budget_prune_ratio} "
+                    f"fusion_alpha={fusion_alpha} "
+                    f"use_thumbnail={self.config.use_thumbnail}")
+                continue
+        return tuple(outputs)
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         modalities = {}
@@ -1312,6 +1904,31 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
     def get_multimodal_embeddings(self,
                                   **kwargs: object) -> MultiModalEmbeddings:
+        relevance_text_embed = kwargs.pop("relevance_text_embed", None)
+        relevance_apply = kwargs.pop("relevance_apply", None)
+        if "budget_prune_ratio" in kwargs:
+            raise RuntimeError(
+                "Goal 3 expects request-level budget_prune_ratios, not the "
+                "legacy group-level budget_prune_ratio."
+            )
+        raw_ratios = kwargs.pop("budget_prune_ratios", None)
+        budget_prune_ratios_override: Optional[list[Optional[float]]] = None
+        if raw_ratios is not None:
+            if not isinstance(raw_ratios, list):
+                raise RuntimeError(
+                    "Goal 3 requires budget_prune_ratios to be a list aligned "
+                    "with the multimodal batch."
+                )
+            budget_prune_ratios_override = []
+            for raw_ratio in raw_ratios:
+                if raw_ratio is None:
+                    budget_prune_ratios_override.append(None)
+                elif isinstance(raw_ratio, (int, float)):
+                    budget_prune_ratios_override.append(float(raw_ratio))
+                else:
+                    raise RuntimeError(
+                        f"Invalid request-level prune ratio payload: {raw_ratio!r}"
+                    )
 
         modalities = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not modalities:
@@ -1326,7 +1943,12 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         for modality in modalities:
             if modality == "images":
                 image_input = modalities["images"]
-                vision_embeddings = self._process_image_input(image_input)
+                vision_embeddings = self._process_image_input(
+                    image_input,
+                    relevance_text_embed=relevance_text_embed,
+                    relevance_apply=relevance_apply,
+                    budget_prune_ratios_override=budget_prune_ratios_override,
+                )
                 multimodal_embeddings += vision_embeddings
             if modality == "videos":
                 video_input = modalities["videos"]

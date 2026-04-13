@@ -29,6 +29,7 @@ class NewRequestData:
     req_id: str
     prompt_token_ids: Optional[list[int]]
     mm_features: list[MultiModalFeatureSpec]
+    mm_trace: bool
     sampling_params: Optional[SamplingParams]
     pooling_params: Optional[PoolingParams]
     block_ids: tuple[list[int], ...]
@@ -46,6 +47,7 @@ class NewRequestData:
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
             mm_features=request.mm_features,
+            mm_trace=request.mm_trace,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             block_ids=block_ids,
@@ -61,6 +63,7 @@ class NewRequestData:
                 f"req_id={self.req_id},"
                 f"prompt_token_ids={self.prompt_token_ids},"
                 f"mm_features={self.mm_features},"
+                f"mm_trace={self.mm_trace},"
                 f"sampling_params={self.sampling_params},"
                 f"block_ids={self.block_ids},"
                 f"num_computed_tokens={self.num_computed_tokens},"
@@ -79,6 +82,7 @@ class NewRequestData:
                 f"req_id={self.req_id},"
                 f"prompt_token_ids_len={prompt_token_ids_len},"
                 f"mm_features={self.mm_features},"
+                f"mm_trace={self.mm_trace},"
                 f"sampling_params={self.sampling_params},"
                 f"block_ids={self.block_ids},"
                 f"num_computed_tokens={self.num_computed_tokens},"

@@ -13,6 +13,7 @@ from vllm.multimodal.cache import BaseMultiModalProcessorCache
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalEncDecInputs,
                                     MultiModalInputs, MultiModalUUIDDict)
 from vllm.multimodal.processing import BaseMultiModalProcessor
+from vllm.mm_trace import strip_mm_trace_kwargs
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 from .data import (DecoderOnlyInputs, EmbedsInputs, EmbedsPrompt,
@@ -238,6 +239,8 @@ class InputPreprocessor:
 
         if mm_processor_kwargs is None:
             mm_processor_kwargs = {}
+        else:
+            mm_processor_kwargs = strip_mm_trace_kwargs(mm_processor_kwargs)
 
         mm_input = mm_processor.apply(
             prompt,

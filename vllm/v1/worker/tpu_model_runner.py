@@ -391,6 +391,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 mm_features=new_req_data.mm_features,
+                mm_trace=new_req_data.mm_trace,
                 sampling_params=sampling_params,
                 pooling_params=None,
                 generator=None,

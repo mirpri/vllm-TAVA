@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 from typing_extensions import TypeAlias
 
@@ -41,6 +42,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.mm_trace import is_env_enabled as mm_trace_env_enabled
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.model_executor.models.interfaces import (SupportsMultiModal,
@@ -592,6 +594,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 mm_features=new_req_data.mm_features,
+                mm_trace=new_req_data.mm_trace,
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
                 generator=generator,
@@ -1507,7 +1510,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _batch_mm_kwargs_from_scheduler(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> tuple[list[MultiModalKwargsItem], list[tuple[str, PlaceholderRange]]]:
+    ) -> tuple[list[MultiModalKwargsItem], list[tuple[str, PlaceholderRange]],
+               list[str]]:
         """Batch multimodal kwargs from scheduled encoder inputs.
 
         Args:
@@ -1515,17 +1519,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs.
 
         Returns:
-            A tuple of (mm_kwargs, req_ids_pos) where:
+            A tuple of (mm_kwargs, mm_hashes_pos, mm_req_ids) where:
             - mm_kwargs: List of multimodal kwargs items to be batched
             - mm_hashes_pos: List of (mm_hash, position_info) tuples
+            - mm_req_ids: List of request IDs matching mm_kwargs order
         """
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
-            return [], []
+            return [], [], []
         # Batch the multi-modal inputs.
         mm_kwargs = list[MultiModalKwargsItem]()
         # list of tuple (mm_hash, position_info)
         mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
+        mm_req_ids = list[str]()
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.requests[req_id]
 
@@ -1534,16 +1540,85 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_hash = mm_feature.identifier
                 mm_kwargs.append(mm_feature.data)
                 mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
+                mm_req_ids.append(req_id)
 
-        return mm_kwargs, mm_hashes_pos
+        return mm_kwargs, mm_hashes_pos, mm_req_ids
 
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
         # Batch the multi-modal inputs using the helper method.
-        mm_kwargs, mm_hashes_pos = self._batch_mm_kwargs_from_scheduler(
+        mm_kwargs, mm_hashes_pos, mm_req_ids = \
+            self._batch_mm_kwargs_from_scheduler(
             scheduler_output)
 
         if not mm_kwargs:
             return
+
+        import os as _os
+        score_mode = _os.getenv("VLLM_MM_PRUNE_SCORE_MODE",
+                                "cls2patch").lower()
+        budget_mode = _os.getenv("VLLM_MM_ANYRES_BUDGET_MODE",
+                                 "default").lower()
+        relevance_debug = _os.environ.get("VLLM_MM_RELEVANCE_DEBUG") == "1"
+        relevance_text_by_req: dict[str, Optional[torch.Tensor]] = {}
+        relevance_apply_by_req: dict[str, bool] = {}
+        #获取LM embedding 均值（文本向量）
+        if score_mode in ("relevance", "fusion") or budget_mode == "relevance":
+            embed_fn = getattr(self.model, "get_input_embeddings", None)
+            for req_id in mm_req_ids:
+                if req_id in relevance_text_by_req:
+                    continue
+                req_state = self.requests.get(req_id)
+                text_embed = None
+                apply_flag = False
+                if embed_fn is not None and req_state is not None:
+                    sampling_params = req_state.sampling_params
+                    extra_args = sampling_params.extra_args \
+                        if sampling_params else None
+                    if isinstance(extra_args, dict):
+                        apply_flag = bool(
+                            extra_args.get("mm_relevance_apply"))
+                        token_ids = extra_args.get(
+                            "mm_relevance_query_token_ids")
+                        if apply_flag and isinstance(token_ids, list) \
+                                and len(token_ids) > 0:
+                            token_tensor = torch.tensor(
+                                token_ids,
+                                device=self.device,
+                                dtype=torch.long,
+                            ).unsqueeze(0)
+                            with torch.no_grad():
+                                token_embeds = embed_fn(token_tensor)
+                                # Text embedding from LM input embeddings.
+                                text_embed = token_embeds.mean(dim=1) \
+                                    .squeeze(0)
+                                text_embed = F.normalize(text_embed, dim=-1)
+                                if relevance_debug:
+                                    logger.info(
+                                        "[MMRelevance] text_embed_ok req_id=%s "
+                                        "score_mode=%s token_ids_len=%s "
+                                        "text_embed_shape=%s",
+                                        req_id,
+                                        score_mode,
+                                        len(token_ids),
+                                        tuple(text_embed.shape),
+                                    )
+                relevance_text_by_req[req_id] = text_embed
+                relevance_apply_by_req[req_id] = bool(
+                    apply_flag and text_embed is not None)
+        if _os.environ.get("VLLM_LOG_MM_ENCODER") == "1":
+            try:
+                from vllm.logger import init_logger as _init_lg
+                _lg = _init_lg(__name__)
+                modalities = []
+                try:
+                    sample = mm_kwargs[0] if mm_kwargs else {}
+                    modalities = sorted(list(sample.keys())) if isinstance(sample, dict) else []
+                except Exception:
+                    modalities = []
+                _lg.info("[MMEnc] batch_start items=%d modalities=%s",
+                         len(mm_kwargs), ",".join(modalities))
+            except Exception:
+                pass
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -1554,12 +1629,84 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # encoder outputs.
         model = cast(SupportsMultiModal, self.model)
         encoder_outputs = []
+        mm_req_offset = 0
         for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
                 mm_kwargs,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 merge_by_field_config=model.merge_by_field_config,
         ):
+            group_req_ids = mm_req_ids[mm_req_offset:mm_req_offset + num_items]
+            mm_req_offset += num_items
+            if (score_mode in ("relevance", "fusion")
+                    or budget_mode == "relevance") \
+                    and relevance_text_by_req:
+                group_text = []
+                group_apply = []
+                ref_embed = None
+                for req_id in group_req_ids:
+                    text_embed = relevance_text_by_req.get(req_id)
+                    apply_flag = relevance_apply_by_req.get(req_id, False)
+                    if text_embed is not None and apply_flag:
+                        group_text.append(text_embed)
+                        group_apply.append(True)
+                        if ref_embed is None:
+                            ref_embed = text_embed
+                    else:
+                        group_text.append(None)
+                        group_apply.append(False)
+                if ref_embed is not None:
+                    zero = torch.zeros_like(ref_embed)
+                    stacked_text = torch.stack(
+                        [t if t is not None else zero for t in group_text],
+                        dim=0,
+                    )#将结果对齐并且正确放入mm_kwargs_group
+                    mm_kwargs_group["relevance_text_embed"] = stacked_text
+                    mm_kwargs_group["relevance_apply"] = torch.tensor(
+                        group_apply,
+                        device=stacked_text.device,
+                        dtype=torch.bool,
+                    )
+                    if relevance_debug:
+                        apply_true_count = sum(1 for v in group_apply if v)
+                        logger.info(
+                            "[MMRelevance] inject_ok modality=%s items=%s "
+                            "apply_true=%s stacked_shape=%s score_mode=%s",
+                            modality,
+                            num_items,
+                            apply_true_count,
+                            tuple(stacked_text.shape),
+                            score_mode,
+                        )
+            group_prune_ratios: list[Optional[float]] = []
+            for req_id in group_req_ids:
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    raise RuntimeError(
+                        f"Missing request state for multimodal req_id={req_id!r}."
+                    )
+                extra_args = getattr(req_state.sampling_params, "extra_args", None)
+                prune_ratio: Optional[float] = None
+                if isinstance(extra_args, dict) and "prune_ratio" in extra_args:
+                    raw_ratio = extra_args["prune_ratio"]
+                    if not isinstance(raw_ratio, (int, float)):
+                        raise RuntimeError(
+                            f"Invalid request prune_ratio for req_id={req_id!r}: "
+                            f"{raw_ratio!r}"
+                        )
+                    prune_ratio = float(raw_ratio)
+                    if not 0.0 <= prune_ratio <= 1.0:
+                        raise RuntimeError(
+                            f"Request prune_ratio out of range for req_id={req_id!r}: "
+                            f"{prune_ratio}"
+                        )
+                group_prune_ratios.append(prune_ratio)
+            if len(group_prune_ratios) != num_items:
+                raise RuntimeError(
+                    "Multimodal request/group prune ratio alignment failed: "
+                    f"items={num_items}, ratios={len(group_prune_ratios)}"
+                )
+            mm_kwargs_group["budget_prune_ratios"] = group_prune_ratios
             # (ekhvedchenia): Temporary hack to limit peak memory usage when
             # processing multimodal data.This solves the issue with scheduler
             # putting too many video samples into a single batch. Scheduler
@@ -1602,6 +1749,46 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 output,
                 is_embed=pos_info.is_embed,
             )
+
+        if mm_trace_env_enabled():
+            for req_id, (mm_hash, pos_info), output in zip(
+                    mm_req_ids, mm_hashes_pos, encoder_outputs):
+                req_state = self.requests.get(req_id)
+                if req_state is None or not req_state.mm_trace:
+                    continue
+                output_shape = None
+                feature_size = None
+                try:
+                    output_shape = tuple(output.shape)
+                    feature_size = output.shape[0]
+                except Exception:
+                    output_shape = None
+                    feature_size = None
+                logger.info(
+                    "[MMTrace] mm_encoder_output request_id=%s mm_hash=%s "
+                    "offset=%s placeholder_len=%s feature_size=%s shape=%s",
+                    req_id,
+                    mm_hash[:8],
+                    pos_info.offset,
+                    pos_info.length,
+                    feature_size,
+                    output_shape,
+                )
+
+        if _os.environ.get("VLLM_LOG_MM_ENCODER") == "1":
+            try:
+                from vllm.logger import init_logger as _init_lg
+                _lg = _init_lg(__name__)
+                shapes = []
+                for out in encoder_outputs:
+                    try:
+                        shapes.append("x".join(map(str, list(out.shape))))
+                    except Exception:
+                        shapes.append("var")
+                _lg.info("[MMEnc] batch_done cached=%d shapes=%s",
+                         len(encoder_outputs), ",".join(shapes))
+            except Exception:
+                pass
 
     def _gather_mm_embeddings(
         self,
@@ -1671,6 +1858,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             mm_embeds.extend(mm_embeds_req)
 
+        import os as _os
+        if _os.environ.get("VLLM_LOG_MM_ENCODER") == "1":
+            try:
+                from vllm.logger import init_logger as _init_lg
+                _lg = _init_lg(__name__)
+                _lg.info("[MMEnc] gather embeds=%d", len(mm_embeds))
+            except Exception:
+                pass
+
         if should_sync_mrope_positions:
             self._calc_mrope_positions(scheduler_output)
             self.mrope_positions.copy_to_gpu(
@@ -1688,7 +1884,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         inputs and formats them for the encoder-decoder model forward pass.
         """
         # Batch the multi-modal inputs using the helper method.
-        mm_kwargs, _ = self._batch_mm_kwargs_from_scheduler(scheduler_output)
+        mm_kwargs, _, _ = self._batch_mm_kwargs_from_scheduler(
+            scheduler_output)
 
         if not mm_kwargs:
             return {}
@@ -3355,6 +3552,38 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         dummy_modality,
                         max_mm_items_per_batch,
                     )
+                    import os as _os
+                    score_mode = _os.getenv("VLLM_MM_PRUNE_SCORE_MODE",
+                                            "cls2patch").lower()
+                    budget_mode = _os.getenv("VLLM_MM_ANYRES_BUDGET_MODE",
+                                             "default").lower()
+                    if score_mode in ("relevance", "fusion") \
+                            or budget_mode == "relevance":
+                        # For relevance score or budget mode, we need to inject dummy relevance embeddings
+                        text_embed = torch.ones(
+                            (max_mm_items_per_batch, self.hidden_size),
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        text_embed = F.normalize(text_embed, dim=-1, eps=1e-6)
+                        batched_dummy_mm_inputs["relevance_text_embed"] = \
+                            text_embed.to(dtype=self.dtype)
+                        batched_dummy_mm_inputs["relevance_apply"] = \
+                            torch.ones(
+                                (max_mm_items_per_batch,),
+                                device=self.device,
+                                dtype=torch.bool,
+                            )
+                        logger.info(
+                            "Profile run dummy relevance injected: "
+                            "score_mode=%s budget_mode=%s items=%s hidden=%s "
+                            "dtype=%s",
+                            score_mode,
+                            budget_mode,
+                            max_mm_items_per_batch,
+                            self.hidden_size,
+                            self.dtype,
+                        )
 
                     # Run multimodal encoder.
                     dummy_encoder_outputs = \
